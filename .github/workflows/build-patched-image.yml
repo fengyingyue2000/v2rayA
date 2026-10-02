@@ -116,7 +116,8 @@ jobs:
         run: |
           trap 'docker logs v2raya-smoke; docker rm -fv v2raya-smoke' EXIT
           docker run -d --name v2raya-smoke -p 127.0.0.1:2017:2017 v2raya-patched:verify
-          curl --fail --silent --show-error --retry 30 --retry-connrefused --retry-delay 1 \
+          curl --fail --silent --show-error --retry 30 --retry-all-errors --retry-delay 1 \
+            --max-time 5 --retry-max-time 60 \
             http://127.0.0.1:2017/ -o served-index.html
           cmp service/server/router/web/index.html served-index.html
       - uses: docker/login-action@v3
