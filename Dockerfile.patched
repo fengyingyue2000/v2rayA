@@ -1,0 +1,3 @@
+FROM mzz2017/v2raya:v2.5.8
+
+COPY --chmod=0755 v2raya /usr/bin/v2raya
