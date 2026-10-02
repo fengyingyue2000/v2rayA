@@ -1,0 +1,135 @@
+name: Build patched v2.5.8 image
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - v2.5.8-redirect-fix
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: v2.5.8-redirect-fix-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'fengyingyue2000/v2rayA' && github.ref == 'refs/heads/v2.5.8-redirect-fix'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CGO_ENABLED: '0'
+      BASE_IMAGE: mzz2017/v2raya:v2.5.8
+      IMAGE: ghcr.io/fengyingyue2000/v2raya
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Verify official base and set version
+        run: |
+          git merge-base --is-ancestor f86763d00b14c565671fcad75f990fdf40facbf4 HEAD
+          echo "PATCH_VERSION=2.5.8-redirect-fix.${GITHUB_SHA:0:12}" >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: service/go.mod
+          cache-dependency-path: |
+            service/go.sum
+            core/go.sum
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Check and build embedded Web UI
+        run: |
+          npm install --global yarn@1.22.22
+          yarn --cwd gui install --frozen-lockfile --non-interactive
+          yarn --cwd gui lint
+          yarn --cwd gui typecheck
+          yarn --cwd gui i18n-check
+          yarn --cwd gui test
+          yarn --cwd gui build
+          mkdir -p service/server/router/web
+          cp -a web/. service/server/router/web/
+          test -s service/server/router/web/index.html
+      - name: Verify regression detects the official bug
+        working-directory: service
+        run: |
+          source=kernel/v2ray/template_routing.go
+          backup=$(mktemp)
+          cp "$source" "$backup"
+          trap 'cp "$backup" "$source"; rm -f "$backup"' EXIT
+          git show f86763d00b14c565671fcad75f990fdf40facbf4:service/kernel/v2ray/template_routing.go > "$source"
+          if go test ./kernel/v2ray -run '^TestAppendDokodemoTProxyListenAddress$' -count=1 -v > regression.log 2>&1; then
+            cat regression.log
+            echo 'Regression test unexpectedly passed on upstream' >&2
+            exit 1
+          fi
+          cat regression.log
+          grep -F 'listen = "127.0.0.1", want "0.0.0.0"' regression.log
+          grep -F -- '--- PASS: TestAppendDokodemoTProxyListenAddress/tproxy' regression.log
+          rm regression.log
+      - name: Check patched service
+        working-directory: service
+        run: |
+          go test ./kernel/v2ray -run '^TestAppendDokodemoTProxyListenAddress$' -count=1 -v
+          go build ./...
+          go vet ./...
+          # The repository's resolver concurrency test requires root.
+          sudo env "PATH=$PATH" "CGO_ENABLED=$CGO_ENABLED" "GOCACHE=$(go env GOCACHE)" "GOMODCACHE=$(go env GOMODCACHE)" go test ./...
+      - name: Check unchanged core
+        working-directory: core
+        run: |
+          go build ./...
+          go vet ./...
+      - name: Build patched service
+        working-directory: service
+        run: |
+          GOOS=linux GOARCH=amd64 go build -trimpath -o ../v2raya \
+            -ldflags="-X github.com/v2rayA/v2rayA/conf.Version=$PATCH_VERSION -s -w"
+          go version -m ../v2raya
+          test -z "$(git status --porcelain --untracked-files=no)"
+      - uses: docker/setup-buildx-action@v3
+      - name: Inspect official runtime image
+        run: |
+          docker pull --platform linux/amd64 "$BASE_IMAGE"
+          docker image inspect "$BASE_IMAGE" > base-image.json
+          jq -e '.[0].Os == "linux" and .[0].Architecture == "amd64"' base-image.json
+          jq '.[0] | {Architecture, Os, RepoDigests, runtime: (.Config | {Entrypoint, Cmd, Env, WorkingDir, User, ExposedPorts, Volumes})}' base-image.json
+          docker run --rm --entrypoint sh "$BASE_IMAGE" -c 'test -x /usr/bin/v2raya && test -x /usr/bin/v2raya_core'
+          docker run --rm --entrypoint sha256sum "$BASE_IMAGE" /usr/bin/v2raya_core > base-core.sha256
+      - name: Build and verify replacement image
+        run: |
+          docker buildx build --platform linux/amd64 --load -f Dockerfile.patched \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.version=$PATCH_VERSION" \
+            -t v2raya-patched:verify .
+          docker image inspect v2raya-patched:verify > patched-image.json
+          diff <(jq -S '.[0].Config | {Entrypoint, Cmd, Env, WorkingDir, User, ExposedPorts, Volumes}' base-image.json) \
+               <(jq -S '.[0].Config | {Entrypoint, Cmd, Env, WorkingDir, User, ExposedPorts, Volumes}' patched-image.json)
+          diff base-core.sha256 <(docker run --rm --entrypoint sha256sum v2raya-patched:verify /usr/bin/v2raya_core)
+          test "$(sha256sum v2raya | cut -d ' ' -f 1)" = \
+               "$(docker run --rm --entrypoint sha256sum v2raya-patched:verify /usr/bin/v2raya | cut -d ' ' -f 1)"
+          docker run --rm v2raya-patched:verify --version | grep -F "$PATCH_VERSION"
+      - name: Verify startup and embedded UI without privileged mode
+        run: |
+          trap 'docker logs v2raya-smoke; docker rm -fv v2raya-smoke' EXIT
+          docker run -d --name v2raya-smoke -p 127.0.0.1:2017:2017 v2raya-patched:verify
+          curl --fail --silent --show-error --retry 30 --retry-connrefused --retry-delay 1 \
+            http://127.0.0.1:2017/ -o served-index.html
+          cmp service/server/router/web/index.html served-index.html
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push the verified image and report digest
+        run: |
+          for tag in 2.5.8-patched 2.5.8-redirect-fix "2.5.8-redirect-fix-$GITHUB_SHA"; do
+            docker tag v2raya-patched:verify "$IMAGE:$tag"
+            docker push "$IMAGE:$tag"
+          done
+          digest=$(docker image inspect "$IMAGE:2.5.8-patched" --format '{{index .RepoDigests 0}}')
+          printf 'Image: `%s:2.5.8-patched`\n\nDigest: `%s`\n\nCommit: `%s`\n' \
+            "$IMAGE" "$digest" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
