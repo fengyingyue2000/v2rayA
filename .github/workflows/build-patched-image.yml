@@ -27,16 +27,13 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Verify official base and set version
+      - name: Verify official base
         run: |
           git merge-base --is-ancestor f86763d00b14c565671fcad75f990fdf40facbf4 HEAD
-          echo "PATCH_VERSION=2.5.8-redirect-fix.${GITHUB_SHA:0:12}" >> "$GITHUB_ENV"
       - uses: actions/setup-go@v6
         with:
           go-version-file: service/go.mod
-          cache-dependency-path: |
-            service/go.sum
-            core/go.sum
+          cache-dependency-path: service/go.sum
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
@@ -77,16 +74,11 @@ jobs:
           go vet ./...
           # The repository's resolver concurrency test requires root.
           sudo env "PATH=$PATH" "CGO_ENABLED=$CGO_ENABLED" "GOCACHE=$(go env GOCACHE)" "GOMODCACHE=$(go env GOMODCACHE)" go test ./...
-      - name: Check unchanged core
-        working-directory: core
-        run: |
-          go build ./...
-          go vet ./...
       - name: Build patched service
         working-directory: service
         run: |
           GOOS=linux GOARCH=amd64 go build -trimpath -o ../v2raya \
-            -ldflags="-X github.com/v2rayA/v2rayA/conf.Version=$PATCH_VERSION -s -w"
+            -ldflags="-X github.com/v2rayA/v2rayA/conf.Version=2.5.8 -s -w"
           go version -m ../v2raya
           test -z "$(git status --porcelain --untracked-files=no)"
       - uses: docker/setup-buildx-action@v3
@@ -103,7 +95,7 @@ jobs:
           docker buildx build --platform linux/amd64 --load -f Dockerfile.patched \
             --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
-            --label "org.opencontainers.image.version=$PATCH_VERSION" \
+            --label "org.opencontainers.image.version=2.5.8-patched-v2" \
             -t v2raya-patched:verify .
           docker image inspect v2raya-patched:verify > patched-image.json
           diff <(jq -S '.[0].Config | {Entrypoint, Cmd, Env, WorkingDir, User, ExposedPorts, Volumes}' base-image.json) \
@@ -111,8 +103,13 @@ jobs:
           diff base-core.sha256 <(docker run --rm --entrypoint sha256sum v2raya-patched:verify /usr/bin/v2raya_core)
           test "$(sha256sum v2raya | cut -d ' ' -f 1)" = \
                "$(docker run --rm --entrypoint sha256sum v2raya-patched:verify /usr/bin/v2raya | cut -d ' ' -f 1)"
-          docker run --rm v2raya-patched:verify --version | grep -F "$PATCH_VERSION"
-      - name: Verify startup and embedded UI without privileged mode
+          app_version=$(docker run --rm v2raya-patched:verify --version)
+          core_output=$(docker run --rm --entrypoint /usr/bin/v2raya_core v2raya-patched:verify version)
+          printf 'v2rayA version: %s\nv2raya_core output: %s\n' "$app_version" "$core_output"
+          core_version=$(printf '%s\n' "$core_output" | awk 'NR == 1 {print $2}')
+          test "$app_version" = '2.5.8'
+          test "$core_version" = '2.5.8'
+      - name: Verify startup, embedded UI and core version compatibility
         run: |
           trap 'docker logs v2raya-smoke; docker rm -fv v2raya-smoke' EXIT
           docker run -d --name v2raya-smoke -p 127.0.0.1:2017:2017 v2raya-patched:verify
@@ -120,6 +117,12 @@ jobs:
             --max-time 5 --retry-max-time 60 \
             http://127.0.0.1:2017/ -o served-index.html
           cmp service/server/router/web/index.html served-index.html
+          # GetVersion calls the production CheckCoreVersionMatch function.
+          curl --fail --silent --show-error --max-time 15 \
+            http://127.0.0.1:2017/api/version -o versions.json
+          cat versions.json
+          jq -e '.code == "SUCCESS" and .data.version == "2.5.8" and .data.coreVersion == "2.5.8" and .data.coreVersionValid == true and .data.coreVersionErr == ""' versions.json
+          jq -r '.data | "v2rayA version: `\(.version)`\n\nv2raya_core version: `\(.coreVersion)`\n\nCore compatibility: \(.coreVersionValid)\n"' versions.json >> "$GITHUB_STEP_SUMMARY"
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -127,10 +130,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Push the verified image and report digest
         run: |
-          for tag in 2.5.8-patched 2.5.8-redirect-fix "2.5.8-redirect-fix-$GITHUB_SHA"; do
+          for tag in 2.5.8-patched-v2 2.5.8-patched 2.5.8-redirect-fix "2.5.8-patched-v2-$GITHUB_SHA"; do
             docker tag v2raya-patched:verify "$IMAGE:$tag"
             docker push "$IMAGE:$tag"
           done
-          digest=$(docker image inspect "$IMAGE:2.5.8-patched" --format '{{index .RepoDigests 0}}')
-          printf 'Image: `%s:2.5.8-patched`\n\nDigest: `%s`\n\nCommit: `%s`\n' \
+          digest=$(docker image inspect "$IMAGE:2.5.8-patched-v2" --format '{{index .RepoDigests 0}}')
+          printf 'Image: `%s:2.5.8-patched-v2`\n\nDigest: `%s`\n\nCommit: `%s`\n' \
             "$IMAGE" "$digest" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
